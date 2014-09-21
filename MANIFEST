@@ -1,0 +1,12 @@
+bstree.h
+Changes
+lib/Net/DNS/Native.pm
+Makefile.PL
+MANIFEST			This list of files
+Native.xs
+ppport.h
+README
+t/use.t
+typemap
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)
