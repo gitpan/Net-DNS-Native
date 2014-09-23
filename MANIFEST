@@ -5,8 +5,14 @@ Makefile.PL
 MANIFEST			This list of files
 Native.xs
 ppport.h
+pthreads-win32/include/pthread.h
+pthreads-win32/include/sched.h
+pthreads-win32/include/semaphore.h
+pthreads-win32/lib/x64/libpthread.a
+pthreads-win32/lib/x86/libpthread.a
 README
-t/use.t
+t/01_use.t
+t/02_dns.t
 typemap
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)
