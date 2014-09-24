@@ -13,6 +13,7 @@ pthreads-win32/lib/x86/libpthread.a
 README
 t/01_use.t
 t/02_dns.t
+t/03_pool.t
 typemap
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)

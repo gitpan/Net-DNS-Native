@@ -5,6 +5,8 @@ use XSLoader;
 use Socket ();
 use Config ();
 
+our $VERSION = '0.04';
+
 our $PERL_OK = $Config::Config{usethreads}||$Config::Config{libs}=~/-l?pthread\b/;
 unless ($PERL_OK) {
 	warn "This perl may crash while using this module. See `WARNING' section in the documentation";
@@ -16,8 +18,6 @@ use constant {
 	GETHOSTBYNAME => 2,
 	GETADDRINFO   => 3
 };
-
-our $VERSION = '0.03';
 
 XSLoader::load('Net::DNS::Native', $VERSION);
 
@@ -161,7 +161,17 @@ If this conditions are not met you may get segfault. To check it run this onelin
 
 =head2 new
 
-This is a class constructor. Doesn't accept any arguments for now.
+This is a class constructor. Accepts this optional parameters:
+
+=over
+
+=item pool => $size
+
+If $size>0, will create thread pool with size=$size which will make resolving job. Otherwise will use default behavior:
+create and finish thread for each resolving request. If thread pool is not enough big to process all supplied requests, than this
+requests will be queued until one of the threads will become free to process next request from the queue.
+
+=back
 
 =head2 getaddrinfo($host, $service, $hints)
 
