@@ -21,4 +21,4 @@ requires:
   Socket: 1.95
 resources:
   repository: https://github.com/olegwtf/p5-Net-DNS-Native
-version: 0.04
+version: 0.05
