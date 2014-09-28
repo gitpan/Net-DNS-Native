@@ -38,6 +38,8 @@ typedef struct {
 	bstree* fd_map;
 	queue* in_queue;
 	int pool;
+	char extra_thread;
+	int busy_threads;
 } Net_DNS_Native;
 
 typedef struct {
@@ -55,14 +57,6 @@ typedef struct {
 	int type;
 	DNS_thread_arg *arg;
 } DNS_result;
-
-char *_copy_str(char *orig) {
-	// workaround for http://www.perlmonks.org/?node_id=742205
-	int len = strlen(orig) + 1;
-	char *new = malloc(len*sizeof(char));
-	memcpy(new, orig, len);
-	return new;
-}
 
 void *_getaddrinfo(void *v_arg) {
 	DNS_thread_arg *arg = (DNS_thread_arg *)v_arg;
@@ -85,6 +79,7 @@ void *_pool_worker(void *v_arg) {
 	while (sem_wait(&self->semaphore) == 0) {
 		pthread_mutex_lock(&self->mutex);
 		void *arg = queue_shift(self->in_queue);
+		if (arg != NULL) self->busy_threads++;
 		pthread_mutex_unlock(&self->mutex);
 		
 		if (arg == NULL) {
@@ -93,6 +88,10 @@ void *_pool_worker(void *v_arg) {
 		}
 		
 		_getaddrinfo(arg);
+		
+		pthread_mutex_lock(&self->mutex);
+		self->busy_threads--;
+		pthread_mutex_unlock(&self->mutex);
 	}
 	
 	return NULL;
@@ -112,33 +111,60 @@ new(char* class, ...)
 		
 		Newx(self, 1, Net_DNS_Native);
 		
-		int i;
+		int i, rc;
 		self->pool = 0;
+		self->extra_thread = 0;
+		self->busy_threads = 0;
+		char *opt;
 		
 		for (i=1; i<items; i+=2) {
-			if (strEQ(SvPV_nolen(ST(i)), "pool")) {
+			opt = SvPV_nolen(ST(i));
+			
+			if (strEQ(opt, "pool")) {
 				self->pool = SvIV(ST(i+1));
 				if (self->pool < 0) self->pool = 0;
+			}
+			else if (strEQ(opt, "extra_thread")) {
+				self->extra_thread = SvIV(ST(i+1));
 			}
 			else {
 				warn("unsupported option: %s", SvPV_nolen(ST(i)));
 			}
 		}
 		
-		pthread_attr_init(&self->thread_attrs);
-		pthread_attr_setdetachstate(&self->thread_attrs, PTHREAD_CREATE_DETACHED);
-		pthread_mutex_init(&self->mutex, NULL);
-		self->fd_map = bstree_new();
+		char attr_ok = 0, mutex_ok = 0, sem_ok = 0;
+		
+		rc = pthread_attr_init(&self->thread_attrs);
+		if (rc != 0) {
+			warn("pthread_attr_init(): %s", strerror(rc));
+			goto FAIL;
+		}
+		attr_ok = 1;
+		rc = pthread_attr_setdetachstate(&self->thread_attrs, PTHREAD_CREATE_DETACHED);
+		if (rc != 0) {
+			warn("pthread_attr_setdetachstate(): %s", strerror(rc));
+			goto FAIL;
+		}
+		rc = pthread_mutex_init(&self->mutex, NULL);
+		if (rc != 0) {
+			warn("pthread_mutex_init(): %s", strerror(rc));
+			goto FAIL;
+		}
+		mutex_ok = 1;
+		
 		self->in_queue = NULL;
 		self->threads_pool = NULL;
 		
 		if (self->pool) {
-			if (sem_init(&self->semaphore, 0, 0) != 0)
+			if (sem_init(&self->semaphore, 0, 0) != 0) {
 				warn("sem_init(): %s", strerror(errno));
+				goto FAIL;
+			}
+			sem_ok = 1;
 			
 			self->threads_pool = malloc(self->pool*sizeof(pthread_t));
 			pthread_t tid;
-			int rc, j = 0;
+			int j = 0;
 			
 			for (i=0; i<self->pool; i++) {
 				rc = pthread_create(&tid, NULL, _pool_worker, (void*)self);
@@ -150,18 +176,27 @@ new(char* class, ...)
 				}
 			}
 			
-			self->pool = j;
 			if (j == 0) {
-				free(self->threads_pool);
-				sem_destroy(&self->semaphore);
+				goto FAIL;
 			}
-			else {
-				self->in_queue = queue_new();
-			}
+			
+			self->pool = j;
+			self->in_queue = queue_new();
 		}
 		
+		self->fd_map = bstree_new();
 		RETVAL = newSV(0);
 		sv_setref_pv(RETVAL, class, (void *)self);
+		
+		if (0) {
+			FAIL:
+				if (attr_ok) pthread_attr_destroy(&self->thread_attrs);
+				if (mutex_ok) pthread_mutex_destroy(&self->mutex);
+				if (sem_ok) sem_destroy(&self->semaphore);
+				if (self->threads_pool) free(self->threads_pool);
+				Safefree(self);
+				RETVAL = &PL_sv_undef;
+		}
 	OUTPUT:
 		RETVAL
 
@@ -224,20 +259,27 @@ _getaddrinfo(Net_DNS_Native *self, char *host, char *service, SV* sv_hints, int 
 		
 		DNS_thread_arg *arg = malloc(sizeof(DNS_thread_arg));
 		arg->self = self;
-		arg->host = strlen(host) ? _copy_str(host) : NULL;
-		arg->service = strlen(service) ? _copy_str(service) : NULL;
+		arg->host = strlen(host) ? savepv(host) : NULL;
+		arg->service = strlen(service) ? savepv(service) : NULL;
 		arg->hints = hints;
 		arg->fd0 = fd[0];
+		
+		char need_extra_thread = 0;
 		
 		pthread_mutex_lock(&self->mutex);
 		bstree_put(self->fd_map, fd[0], res);
 		if (self->pool) {
-			queue_push(self->in_queue, arg);
-			sem_post(&self->semaphore);
+			if (self->extra_thread && self->busy_threads == self->pool) {
+				need_extra_thread = 1;
+			}
+			else {
+				queue_push(self->in_queue, arg);
+				sem_post(&self->semaphore);
+			}
 		}
 		pthread_mutex_unlock(&self->mutex);
 		
-		if (!self->pool) {
+		if (!self->pool || need_extra_thread) {
 			pthread_t tid;
 			int rc = pthread_create(&tid, &self->thread_attrs, _getaddrinfo, (void *)arg);
 			if (rc != 0) {
@@ -298,8 +340,8 @@ _get_result(Net_DNS_Native *self, int fd)
 		//close(fd); // will be closed by perl
 		close(res->fd1);
 		if (res->arg->hints)   free(res->arg->hints);
-		if (res->arg->host)    free(res->arg->host);
-		if (res->arg->service) free(res->arg->service);
+		if (res->arg->host)    Safefree(res->arg->host);
+		if (res->arg->service) Safefree(res->arg->service);
 		free(res->arg);
 		free(res);
 
