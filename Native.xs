@@ -20,7 +20,7 @@
 # define write _write
 #endif
 
-// sem_init() is not implemented in this POSIX compatible UNIX system
+// unnamed semaphores are not implemented in this POSIX compatible UNIX system
 #ifdef PERL_DARWIN
 # include <dispatch/dispatch.h>
 # define sem_t dispatch_semaphore_t
@@ -39,7 +39,9 @@ typedef struct {
 	queue* in_queue;
 	int pool;
 	char extra_thread;
+	int extra_threads_cnt;
 	int busy_threads;
+	queue* tout_queue;
 } Net_DNS_Native;
 
 typedef struct {
@@ -48,6 +50,7 @@ typedef struct {
 	char *service;
 	struct addrinfo *hints;
 	int fd0;
+	char extra;
 } DNS_thread_arg;
 
 typedef struct {
@@ -58,6 +61,11 @@ typedef struct {
 	DNS_thread_arg *arg;
 } DNS_result;
 
+typedef struct {
+	int fd0;
+	SV* sock0;
+} DNS_timedout;
+
 void *_getaddrinfo(void *v_arg) {
 	DNS_thread_arg *arg = (DNS_thread_arg *)v_arg;
 	
@@ -67,8 +75,11 @@ void *_getaddrinfo(void *v_arg) {
 	
 	res->error = getaddrinfo(arg->host, arg->service, arg->hints, &res->hostinfo);
 	
+	pthread_mutex_lock(&arg->self->mutex);
 	res->arg = arg;
+	if (arg->extra) arg->self->extra_threads_cnt--;
 	write(res->fd1, "1", 1);
+	pthread_mutex_unlock(&arg->self->mutex);
 	
 	return NULL;
 }
@@ -97,6 +108,45 @@ void *_pool_worker(void *v_arg) {
 	return NULL;
 }
 
+void _free_timedout(Net_DNS_Native *self) {
+	if (queue_size(self->tout_queue)) {
+		queue_iterator *it = queue_iterator_new(self->tout_queue);
+		DNS_timedout *tout;
+		DNS_result *res;
+		
+		while (!queue_iterator_end(it)) {
+			tout = queue_at(self->tout_queue, it);
+			res = bstree_get(self->fd_map, tout->fd0);
+			if (res == NULL) {
+				goto FREE_TOUT;
+			}
+			
+			if (res->arg) {
+				bstree_del(self->fd_map, tout->fd0);
+				if (!res->error && res->hostinfo)
+					freeaddrinfo(res->hostinfo);
+				
+				close(res->fd1);
+				if (res->arg->hints)   free(res->arg->hints);
+				if (res->arg->host)    Safefree(res->arg->host);
+				if (res->arg->service) Safefree(res->arg->service);
+				free(res->arg);
+				free(res);
+				
+				FREE_TOUT:
+					SvREFCNT_dec(tout->sock0);
+					queue_del(self->tout_queue, it);
+					free(tout);
+					continue;
+			}
+			
+			queue_iterator_next(it);
+		}
+		
+		queue_iterator_destroy(it);
+	}
+}
+
 MODULE = Net::DNS::Native	PACKAGE = Net::DNS::Native
 
 PROTOTYPES: DISABLE
@@ -114,6 +164,7 @@ new(char* class, ...)
 		int i, rc;
 		self->pool = 0;
 		self->extra_thread = 0;
+		self->extra_threads_cnt = 0;
 		self->busy_threads = 0;
 		char *opt;
 		
@@ -185,6 +236,7 @@ new(char* class, ...)
 		}
 		
 		self->fd_map = bstree_new();
+		self->tout_queue = queue_new();
 		RETVAL = newSV(0);
 		sv_setref_pv(RETVAL, class, (void *)self);
 		
@@ -263,14 +315,15 @@ _getaddrinfo(Net_DNS_Native *self, char *host, char *service, SV* sv_hints, int 
 		arg->service = strlen(service) ? savepv(service) : NULL;
 		arg->hints = hints;
 		arg->fd0 = fd[0];
-		
-		char need_extra_thread = 0;
+		arg->extra = 0;
 		
 		pthread_mutex_lock(&self->mutex);
+		_free_timedout(self);
 		bstree_put(self->fd_map, fd[0], res);
 		if (self->pool) {
-			if (self->extra_thread && self->busy_threads == self->pool) {
-				need_extra_thread = 1;
+			if (self->busy_threads == self->pool && (self->extra_thread || queue_size(self->tout_queue) > self->extra_threads_cnt)) {
+				arg->extra = 1;
+				self->extra_threads_cnt++;
 			}
 			else {
 				queue_push(self->in_queue, arg);
@@ -279,7 +332,7 @@ _getaddrinfo(Net_DNS_Native *self, char *host, char *service, SV* sv_hints, int 
 		}
 		pthread_mutex_unlock(&self->mutex);
 		
-		if (!self->pool || need_extra_thread) {
+		if (!self->pool || arg->extra) {
 			pthread_t tid;
 			int rc = pthread_create(&tid, &self->thread_attrs, _getaddrinfo, (void *)arg);
 			if (rc != 0) {
@@ -346,8 +399,33 @@ _get_result(Net_DNS_Native *self, int fd)
 		free(res);
 
 void
+_timedout(Net_DNS_Native *self, SV *sock, int fd)
+	PPCODE:
+		char unknown = 0;
+		
+		pthread_mutex_lock(&self->mutex);
+		if (bstree_get(self->fd_map, fd) == NULL) {
+			unknown = 1;
+		}
+		else {
+			sock = SvREFCNT_inc(sock);
+			DNS_timedout *tout = malloc(sizeof(DNS_timedout));
+			tout->fd0 = fd;
+			tout->sock0 = sock;
+			queue_push(self->tout_queue, tout);
+		}
+		pthread_mutex_unlock(&self->mutex);
+		
+		if (unknown)
+			croak("attempt to set timeout on unknown source");
+
+void
 DESTROY(Net_DNS_Native *self)
 	CODE:
+		pthread_mutex_lock(&self->mutex);
+		_free_timedout(self);
+		pthread_mutex_unlock(&self->mutex);
+		
 		if (self->pool) {
 			pthread_mutex_lock(&self->mutex);
 			if (queue_size(self->in_queue) > 0) {
@@ -379,6 +457,7 @@ DESTROY(Net_DNS_Native *self)
 		pthread_attr_destroy(&self->thread_attrs);
 		pthread_mutex_destroy(&self->mutex);
 		bstree_destroy(self->fd_map);
+		queue_destroy(self->tout_queue);
 		Safefree(self);
 
 void
