@@ -5,12 +5,7 @@ use XSLoader;
 use Socket ();
 use Config ();
 
-our $VERSION = '0.08';
-
-our $PERL_OK = $Config::Config{usethreads}||$Config::Config{libs}=~/-l?pthread\b/;
-unless ($PERL_OK) {
-	warn "This perl may crash while using this module. See `WARNING' section in the documentation";
-}
+our $VERSION = '0.09';
 
 use constant {
 	INET_ATON     => 0,
