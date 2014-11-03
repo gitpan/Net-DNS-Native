@@ -343,12 +343,14 @@ _getaddrinfo(Net_DNS_Native *self, char *host, char *service, SV* sv_hints, int 
 			pthread_t tid;
 			int rc = pthread_create(&tid, &self->thread_attrs, DNS_getaddrinfo, (void *)arg);
 			if (rc != 0) {
-				if (arg->host)    free(arg->host);
-				if (arg->service) free(arg->service);
+				if (arg->host)    Safefree(arg->host);
+				if (arg->service) Safefree(arg->service);
 				free(arg);
 				free(res);
 				if (hints) free(hints);
+				pthread_mutex_lock(&self->mutex);
 				bstree_del(self->fd_map, fd[0]);
+				pthread_mutex_unlock(&self->mutex);
 				close(fd[0]);
 				close(fd[1]);
 				croak("pthread_create(): %s", strerror(rc));

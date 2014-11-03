@@ -16,6 +16,7 @@ t/01_use.t
 t/02_dns.t
 t/03_pool.t
 t/04_notify_on_begin.t
+t/05_segfault.t
 typemap
 META.yml                                 Module YAML meta-data (added by MakeMaker)
 META.json                                Module JSON meta-data (added by MakeMaker)
