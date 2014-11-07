@@ -1,10 +1,11 @@
 package Net::DNS::Native;
 
 use strict;
-use XSLoader;
+use DynaLoader;
 use Socket ();
+use Config;
 
-our $VERSION = '0.10';
+our $VERSION = '0.11';
 
 use constant {
 	INET_ATON     => 0,
@@ -13,7 +14,17 @@ use constant {
 	GETADDRINFO   => 3
 };
 
-XSLoader::load('Net::DNS::Native', $VERSION);
+our @ISA = 'DynaLoader';
+sub dl_load_flags { 
+	if ($Config{osname} =~ /linux/i && 
+	   !($Config{usethreads} || $Config{libs} =~ /-l?pthread\b/ || $Config{ldflags} =~ /-l?pthread\b/))
+	{
+		return 0x01;
+	}
+	
+	return 0;
+}
+DynaLoader::bootstrap('Net::DNS::Native');
 
 sub _fd2socket($) {
 	open my $sock, '+<&=' . $_[0]
@@ -146,8 +157,10 @@ shouldn't be too big.
 
 =head1 INSTALLATION WARNING
 
-To support threaded extensions like this one your perl should be linked with threads library. At the installation time
-this module will check is your perl is good enough and will not install if not.
+For some platforms to support threaded extensions like this one your perl should be linked with threads library. At the
+installation time this module will check is your perl is good enough and will not install if not.
+
+If it will fail to install use instructions listed below.
 
 One of the possible solution to make your perl compatible with this module is to build perl with perl threads support
 using C<-Dusethreads> for C<Configure> script. Other solution is to use C<-A prepend:libswanted="pthread ">, which will

@@ -22,12 +22,12 @@
 
 // unnamed semaphores are not implemented in this POSIX compatible UNIX system
 #ifdef PERL_DARWIN
-# include <dispatch/dispatch.h>
-# define sem_t dispatch_semaphore_t
-# define sem_init(sem, pshared, value) ((*sem = dispatch_semaphore_create(value)) == NULL ? -1 : 0)
-# define sem_wait(sem) dispatch_semaphore_wait(*sem, DISPATCH_TIME_FOREVER)
-# define sem_post(sem) dispatch_semaphore_signal(*sem)
-# define sem_destroy(sem) dispatch_release(*sem)
+# include "mysemaphore.h"
+# define sem_t my_sem_t
+# define sem_init my_sem_init
+# define sem_wait my_sem_wait
+# define sem_post my_sem_post
+# define sem_destroy my_sem_destroy
 #endif
 
 typedef struct {
@@ -43,6 +43,8 @@ typedef struct {
 	int extra_threads_cnt;
 	int busy_threads;
 	queue* tout_queue;
+	char forked;
+	char need_pool_reinit;
 } Net_DNS_Native;
 
 typedef struct {
@@ -66,6 +68,8 @@ typedef struct {
 	int fd0;
 	SV* sock0;
 } DNS_timedout;
+
+queue *DNS_instances = NULL;
 
 void *DNS_getaddrinfo(void *v_arg) {
 	DNS_thread_arg *arg = (DNS_thread_arg *)v_arg;
@@ -111,7 +115,7 @@ void *DNS_pool_worker(void *v_arg) {
 	return NULL;
 }
 
-void DNS_free_timedout(Net_DNS_Native *self) {
+void DNS_free_timedout(Net_DNS_Native *self, char force) {
 	if (queue_size(self->tout_queue)) {
 		queue_iterator *it = queue_iterator_new(self->tout_queue);
 		DNS_timedout *tout;
@@ -124,16 +128,18 @@ void DNS_free_timedout(Net_DNS_Native *self) {
 				goto FREE_TOUT;
 			}
 			
-			if (res->arg) {
+			if (force || res->arg) {
 				bstree_del(self->fd_map, tout->fd0);
 				if (!res->error && res->hostinfo)
 					freeaddrinfo(res->hostinfo);
 				
 				close(res->fd1);
-				if (res->arg->hints)   free(res->arg->hints);
-				if (res->arg->host)    Safefree(res->arg->host);
-				if (res->arg->service) Safefree(res->arg->service);
-				free(res->arg);
+				if (res->arg) {
+					if (res->arg->hints)   free(res->arg->hints);
+					if (res->arg->host)    Safefree(res->arg->host);
+					if (res->arg->service) Safefree(res->arg->service);
+					free(res->arg);
+				}
 				free(res);
 				
 				FREE_TOUT:
@@ -148,6 +154,100 @@ void DNS_free_timedout(Net_DNS_Native *self) {
 		
 		queue_iterator_destroy(it);
 	}
+}
+
+void DNS_lock_semaphore(sem_t *s) {
+#ifdef PERL_DARWIN
+	pthread_mutex_lock(&s->lock);
+#endif
+}
+
+void DNS_unlock_semaphore(sem_t *s) {
+#ifdef PERL_DARWIN
+	pthread_mutex_unlock(&s->lock);
+#endif
+}
+
+void DNS_before_fork_handler() {
+	if (queue_size(DNS_instances) == 0) {
+		return;
+	}
+	
+	Net_DNS_Native *self;
+	queue_iterator *it = queue_iterator_new(DNS_instances);
+	while (!queue_iterator_end(it)) {
+		self = queue_at(DNS_instances, it);
+		pthread_mutex_lock(&self->mutex);
+		if (self->pool) DNS_lock_semaphore(&self->semaphore);
+		queue_iterator_next(it);
+	}
+	queue_iterator_destroy(it);
+}
+
+void DNS_after_fork_handler_parent() {
+	if (queue_size(DNS_instances) == 0) {
+		return;
+	}
+	
+	Net_DNS_Native *self;
+	queue_iterator *it = queue_iterator_new(DNS_instances);
+	while (!queue_iterator_end(it)) {
+		self = queue_at(DNS_instances, it);
+		pthread_mutex_unlock(&self->mutex);
+		if (self->pool) DNS_unlock_semaphore(&self->semaphore);
+		queue_iterator_next(it);
+	}
+	queue_iterator_destroy(it);
+}
+
+void DNS_reinit_pool(Net_DNS_Native *self) {
+	pthread_t tid;
+	int i, rc;
+	
+	for (i=0; i<self->pool; i++) {
+		rc = pthread_create(&tid, NULL, DNS_pool_worker, (void*)self);
+		if (rc == 0) {
+			self->threads_pool[i] = tid;
+		}
+		else {
+			croak("Can't recreate thread #%d after fork: %s", i+1, strerror(rc));
+		}
+	}
+}
+
+void DNS_after_fork_handler_child() {
+	if (queue_size(DNS_instances) == 0) {
+		return;
+	}
+	
+	Net_DNS_Native *self;
+	queue_iterator *it = queue_iterator_new(DNS_instances);
+	
+	while (!queue_iterator_end(it)) {
+		self = queue_at(DNS_instances, it);
+		pthread_mutex_unlock(&self->mutex);
+		if (self->pool) DNS_unlock_semaphore(&self->semaphore);
+		
+		// reinitialize stuff
+		DNS_free_timedout(self, 1);
+		
+		self->extra_threads_cnt = 0;
+		self->busy_threads = 0;
+		self->forked = 1;
+		
+		if (self->pool) {
+		#ifdef __NetBSD__
+			// unfortunetly under NetBSD threads created here will misbehave
+			self->need_pool_reinit = 1;
+		#else
+			DNS_reinit_pool(self);
+		#endif
+		}
+		
+		queue_iterator_next(it);
+	}
+	
+	queue_iterator_destroy(it);
 }
 
 MODULE = Net::DNS::Native	PACKAGE = Net::DNS::Native
@@ -170,6 +270,8 @@ new(char* class, ...)
 		self->extra_thread = 0;
 		self->extra_threads_cnt = 0;
 		self->busy_threads = 0;
+		self->forked = 0;
+		self->need_pool_reinit = 0;
 		char *opt;
 		
 		for (i=1; i<items; i+=2) {
@@ -212,6 +314,17 @@ new(char* class, ...)
 		
 		self->in_queue = NULL;
 		self->threads_pool = NULL;
+		
+		if (DNS_instances == NULL) {
+			DNS_instances = queue_new();
+		#ifndef WIN32
+			rc = pthread_atfork(DNS_before_fork_handler, DNS_after_fork_handler_parent, DNS_after_fork_handler_child);
+			if (rc != 0) {
+				warn("Can't install fork handler: %s", strerror(rc));
+				goto FAIL;
+			}
+		#endif
+		}
 		
 		if (self->pool) {
 			if (sem_init(&self->semaphore, 0, 0) != 0) {
@@ -256,6 +369,8 @@ new(char* class, ...)
 				Safefree(self);
 				RETVAL = &PL_sv_undef;
 		}
+		
+		queue_push(DNS_instances, self);
 	OUTPUT:
 		RETVAL
 
@@ -264,6 +379,12 @@ _getaddrinfo(Net_DNS_Native *self, char *host, char *service, SV* sv_hints, int 
 	INIT:
 		int fd[2];
 	CODE:
+	#ifdef __NetBSD__
+		if (self->need_pool_reinit) {
+			self->need_pool_reinit = 0;
+			DNS_reinit_pool(self);
+		}
+	#endif
 		if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, fd) != 0)
 			croak("socketpair(): %s", strerror(errno));
 		
@@ -325,7 +446,7 @@ _getaddrinfo(Net_DNS_Native *self, char *host, char *service, SV* sv_hints, int 
 		arg->extra = 0;
 		
 		pthread_mutex_lock(&self->mutex);
-		DNS_free_timedout(self);
+		DNS_free_timedout(self, 0);
 		bstree_put(self->fd_map, fd[0], res);
 		if (self->pool) {
 			if (self->busy_threads == self->pool && (self->extra_thread || queue_size(self->tout_queue) > self->extra_threads_cnt)) {
@@ -432,7 +553,7 @@ void
 DESTROY(Net_DNS_Native *self)
 	CODE:
 		pthread_mutex_lock(&self->mutex);
-		DNS_free_timedout(self);
+		DNS_free_timedout(self, 0);
 		pthread_mutex_unlock(&self->mutex);
 		
 		if (self->pool) {
@@ -451,6 +572,10 @@ DESTROY(Net_DNS_Native *self)
 			void *rv;
 			
 			for (i=0; i<self->pool; i++) {
+			#ifdef __NetBSD__
+				// unfortunetly NetBSD can join only first thread after fork
+				if (self->forked && i > 0) break;
+			#endif
 				pthread_join(self->threads_pool[i], &rv);
 			}
 			
@@ -462,6 +587,16 @@ DESTROY(Net_DNS_Native *self)
 		if (bstree_size(self->fd_map) > 0) {
 			warn("destroying object with %d non-received results", bstree_size(self->fd_map));
 		}
+		
+		queue_iterator *it = queue_iterator_new(DNS_instances);
+		while (!queue_iterator_end(it)) {
+			if (queue_at(DNS_instances, it) == self) {
+				queue_del(DNS_instances, it);
+				break;
+			}
+			queue_iterator_next(it);
+		}
+		queue_iterator_destroy(it);
 		
 		pthread_attr_destroy(&self->thread_attrs);
 		pthread_mutex_destroy(&self->mutex);
