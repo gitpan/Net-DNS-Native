@@ -45,6 +45,7 @@ typedef struct {
 	queue* tout_queue;
 	char forked;
 	char need_pool_reinit;
+	UV perl_id;
 } Net_DNS_Native;
 
 typedef struct {
@@ -233,15 +234,16 @@ void DNS_after_fork_handler_child() {
 		
 		self->extra_threads_cnt = 0;
 		self->busy_threads = 0;
+		self->perl_id = (UV)PERL_GET_THX;
 		self->forked = 1;
 		
 		if (self->pool) {
-		#ifdef __NetBSD__
+#ifdef __NetBSD__
 			// unfortunetly under NetBSD threads created here will misbehave
 			self->need_pool_reinit = 1;
-		#else
+#else
 			DNS_reinit_pool(self);
-		#endif
+#endif
 		}
 		
 		queue_iterator_next(it);
@@ -272,6 +274,7 @@ new(char* class, ...)
 		self->busy_threads = 0;
 		self->forked = 0;
 		self->need_pool_reinit = 0;
+		self->perl_id = (UV)PERL_GET_THX;
 		char *opt;
 		
 		for (i=1; i<items; i+=2) {
@@ -317,13 +320,13 @@ new(char* class, ...)
 		
 		if (DNS_instances == NULL) {
 			DNS_instances = queue_new();
-		#ifndef WIN32
+#ifndef WIN32
 			rc = pthread_atfork(DNS_before_fork_handler, DNS_after_fork_handler_parent, DNS_after_fork_handler_child);
 			if (rc != 0) {
 				warn("Can't install fork handler: %s", strerror(rc));
 				goto FAIL;
 			}
-		#endif
+#endif
 		}
 		
 		if (self->pool) {
@@ -375,19 +378,20 @@ new(char* class, ...)
 		RETVAL
 
 int
-_getaddrinfo(Net_DNS_Native *self, char *host, char *service, SV* sv_hints, int type)
+_getaddrinfo(Net_DNS_Native *self, char *host, SV* sv_service, SV* sv_hints, int type)
 	INIT:
 		int fd[2];
 	CODE:
-	#ifdef __NetBSD__
+#ifdef __NetBSD__
 		if (self->need_pool_reinit) {
 			self->need_pool_reinit = 0;
 			DNS_reinit_pool(self);
 		}
-	#endif
+#endif
 		if (socketpair(AF_UNIX, SOCK_STREAM, PF_UNSPEC, fd) != 0)
 			croak("socketpair(): %s", strerror(errno));
 		
+		char *service = SvOK(sv_service) ? SvPV_nolen(sv_service) : "";
 		struct addrinfo *hints = NULL;
 		
 		if (SvOK(sv_hints)) {
@@ -552,6 +556,11 @@ _timedout(Net_DNS_Native *self, SV *sock, int fd)
 void
 DESTROY(Net_DNS_Native *self)
 	CODE:
+		if ((UV)PERL_GET_THX != self->perl_id) {
+			// attempt to destroy from another perl thread
+			return;
+		}
+		
 		pthread_mutex_lock(&self->mutex);
 		DNS_free_timedout(self, 0);
 		pthread_mutex_unlock(&self->mutex);
@@ -572,10 +581,10 @@ DESTROY(Net_DNS_Native *self)
 			void *rv;
 			
 			for (i=0; i<self->pool; i++) {
-			#ifdef __NetBSD__
+#ifdef __NetBSD__
 				// unfortunetly NetBSD can join only first thread after fork
 				if (self->forked && i > 0) break;
-			#endif
+#endif
 				pthread_join(self->threads_pool[i], &rv);
 			}
 			

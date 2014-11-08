@@ -1,11 +1,12 @@
 package Net::DNS::Native;
 
 use strict;
+use warnings;
 use DynaLoader;
 use Socket ();
 use Config;
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 
 use constant {
 	INET_ATON     => 0,
