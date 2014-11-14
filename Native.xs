@@ -18,6 +18,7 @@
 #if defined(WIN32) && !defined(UNDER_CE)
 # include <io.h>
 # define write _write
+# define read _read
 #endif
 
 // unnamed semaphores are not implemented in this POSIX compatible UNIX system
@@ -45,7 +46,7 @@ typedef struct {
 	queue* tout_queue;
 	char forked;
 	char need_pool_reinit;
-	UV perl_id;
+	PerlInterpreter *perl;
 } Net_DNS_Native;
 
 typedef struct {
@@ -234,7 +235,7 @@ void DNS_after_fork_handler_child() {
 		
 		self->extra_threads_cnt = 0;
 		self->busy_threads = 0;
-		self->perl_id = (UV)PERL_GET_THX;
+		self->perl = PERL_GET_THX;
 		self->forked = 1;
 		
 		if (self->pool) {
@@ -274,7 +275,7 @@ new(char* class, ...)
 		self->busy_threads = 0;
 		self->forked = 0;
 		self->need_pool_reinit = 0;
-		self->perl_id = (UV)PERL_GET_THX;
+		self->perl = PERL_GET_THX;
 		char *opt;
 		
 		for (i=1; i<items; i+=2) {
@@ -556,7 +557,7 @@ _timedout(Net_DNS_Native *self, SV *sock, int fd)
 void
 DESTROY(Net_DNS_Native *self)
 	CODE:
-		if ((UV)PERL_GET_THX != self->perl_id) {
+		if (PERL_GET_THX != self->perl) {
 			// attempt to destroy from another perl thread
 			return;
 		}
@@ -594,7 +595,18 @@ DESTROY(Net_DNS_Native *self)
 		}
 		
 		if (bstree_size(self->fd_map) > 0) {
-			warn("destroying object with %d non-received results", bstree_size(self->fd_map));
+			warn("destroying object with %d non-received or timed out results", bstree_size(self->fd_map));
+			
+			int *fds = bstree_keys(self->fd_map);
+			int i, l;
+			char buf[1];
+			
+			for (i=0, l=bstree_size(self->fd_map); i<l; i++) {
+				read(fds[i], buf, 1);
+			}
+			
+			free(fds);
+			DNS_free_timedout(self, 0);
 		}
 		
 		queue_iterator *it = queue_iterator_new(DNS_instances);
